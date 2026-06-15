@@ -1,0 +1,38 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Runtime data and secrets
+data/*
+backend/data/*
+!data/.gitkeep
+!backend/data/.gitkeep
+!data/logs/.gitkeep
+!data/sessions/.gitkeep
+!backend/data/logs/.gitkeep
+!backend/data/sessions/.gitkeep
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.jsonl
+*.session
+*.session-journal
+*.log
+*.csv
+
+# Python
+backend/.venv/
+backend/build/
+backend/*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Local exports
+output/
