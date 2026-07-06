@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.api import routers
 from app.core.config import settings
@@ -62,3 +65,8 @@ for router in routers:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+frontend_dist = Path(os.getenv("WATCHOUT_TELEGRAM_FRONTEND_DIST", "/app/frontend_dist"))
+if frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
