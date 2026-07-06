@@ -176,7 +176,7 @@ api_hash
 api_id
 api_hash
 phone
-proxy_url，可选
+proxy_url，可选；服务器不能直连 Telegram 时需要配置
 ```
 
 授权流程：
@@ -186,6 +186,34 @@ proxy_url，可选
 ```
 
 如果账号开启了二步密码，系统会继续要求输入二步密码。授权成功后，会在 session 目录生成 Telegram session 文件。
+
+### Telegram 网络与代理
+
+如果服务器或容器本身可以直连 Telegram，账号代理可以留空。留空时后端会直接连接 Telegram，不会自动使用页面里的示例地址。
+
+如果服务器不能直连 Telegram，需要在「账号管理」添加账号时配置代理，否则发送验证码、登录授权、实时监听和历史回爬都可能失败。
+
+Docker 部署时要注意：`127.0.0.1` 指的是 **app 容器内部**，不是宿主机。如果代理运行在宿主机上，通常应填写：
+
+```text
+socks5://host.docker.internal:7891
+http://host.docker.internal:7890
+```
+
+常见场景：
+
+```text
+本机 Docker Desktop + Clash/V2Ray 在宿主机运行：
+  使用 host.docker.internal 和宿主机代理端口。
+
+Linux 服务器 + 代理也在 Docker Compose 中：
+  推荐把代理服务放到同一个 compose 网络，用服务名作为主机名，例如 socks5://proxy:1080。
+
+Linux 服务器 + 代理跑在宿主机：
+  可在 compose 中加入 host.docker.internal 到宿主机网关的映射，或直接填写宿主机内网 IP。
+```
+
+不建议在 Docker 部署中填写 `socks5://127.0.0.1:1080`，除非代理进程确实也运行在同一个 app 容器内。
 
 ### 导入监控目标
 

@@ -1295,15 +1295,15 @@ function Accounts({ accounts, reload, collectionConfig = {} }) {
                 {form.proxy_type !== "none" ? (
                   <>
                     <SimpleGrid cols={{ base: 1, sm: 2 }}>
-                      <TextInput label="主机" placeholder="127.0.0.1" value={form.proxy_host} onChange={(e) => setForm({ ...form, proxy_host: e.currentTarget.value })} />
-                      <TextInput label="端口" placeholder="1080" value={form.proxy_port} onChange={(e) => setForm({ ...form, proxy_port: e.currentTarget.value.replace(/\D/g, "") })} />
+                      <TextInput label="主机" placeholder="host.docker.internal" value={form.proxy_host} onChange={(e) => setForm({ ...form, proxy_host: e.currentTarget.value })} />
+                      <TextInput label="端口" placeholder="7891" value={form.proxy_port} onChange={(e) => setForm({ ...form, proxy_port: e.currentTarget.value.replace(/\D/g, "") })} />
                     </SimpleGrid>
                     <SimpleGrid cols={{ base: 1, sm: 2 }}>
                       <TextInput label="用户名" value={form.proxy_username} onChange={(e) => setForm({ ...form, proxy_username: e.currentTarget.value })} />
                       <PasswordInput label="密码" value={form.proxy_password} onChange={(e) => setForm({ ...form, proxy_password: e.currentTarget.value })} />
                     </SimpleGrid>
                   </>
-                ) : <Alert color="gray">不配置代理时，后端需要能够直连 Telegram。</Alert>}
+                ) : <Alert color="gray">不配置代理时，后端需要能够直连 Telegram；Docker 中连接宿主机代理请使用 host.docker.internal。</Alert>}
               </Stack>
             ) : null}
             {createStep === "auth" ? (
@@ -1564,7 +1564,7 @@ function Accounts({ accounts, reload, collectionConfig = {} }) {
                           <TextInput label="账号名称" value={accountEdit.label} onChange={(event) => setAccountEdit({ ...accountEdit, label: event.currentTarget.value })} />
                           <TextInput label="手机号" value={selectedAccount.phone || ""} readOnly />
                           <TextInput label="当前代理" value={selectedAccount.proxy_status === "none" ? "未配置代理" : state.proxy.label} readOnly />
-                          <TextInput label="更新代理" placeholder="socks5://127.0.0.1:7890，留空则不修改" value={accountEdit.proxy_url} onChange={(event) => setAccountEdit({ ...accountEdit, proxy_url: event.currentTarget.value })} />
+                          <TextInput label="更新代理" placeholder="socks5://host.docker.internal:7891，留空则不修改" value={accountEdit.proxy_url} onChange={(event) => setAccountEdit({ ...accountEdit, proxy_url: event.currentTarget.value })} />
                           <Text size="xs" c="dimmed">完整代理不会从后端回显；修改时请重新输入完整代理地址。</Text>
                           <Switch label="启用账号" checked={Boolean(selectedAccount.is_active)} onChange={(event) => saveAccountActive(selectedAccount, event.currentTarget.checked)} />
                           <Group justify="flex-end">
@@ -3955,7 +3955,7 @@ function Matches({ hits, initialRuleId = "", rules = [], reload, defaultPageSize
 }
 
 function NotificationsPanel({ channels, reload }) {
-  const defaultTelegramProxy = "socks5://127.0.0.1:1080";
+  const defaultTelegramProxy = "";
   const emptyForm = { name: "", type: "telegram_bot", bot_token: "", chat_ids: "", proxy_url: defaultTelegramProxy, url: "", min_risk_level: 1, enabled: true };
   const [form, setForm] = useState(emptyForm);
   const [drawerOpened, setDrawerOpened] = useState(false);
@@ -4300,7 +4300,7 @@ function NotificationsPanel({ channels, reload }) {
 	              <>
 	                <TextInput label="Bot Token" value={form.bot_token} onChange={(e) => setForm({ ...form, bot_token: e.currentTarget.value })} required />
 	                <TextInput label="Chat IDs" placeholder="逗号分隔" value={form.chat_ids} onChange={(e) => setForm({ ...form, chat_ids: e.currentTarget.value })} required />
-	                <TextInput label="代理 URL" description="Telegram Bot API 访问超时时使用；留空则直连。" placeholder="socks5://127.0.0.1:1080" value={form.proxy_url} onChange={(e) => setForm({ ...form, proxy_url: e.currentTarget.value })} />
+	                <TextInput label="代理 URL" description="Telegram Bot API 访问超时时使用；Docker 中连接宿主机代理请使用 host.docker.internal。" placeholder="socks5://host.docker.internal:7891" value={form.proxy_url} onChange={(e) => setForm({ ...form, proxy_url: e.currentTarget.value })} />
 	              </>
             ) : (
               form.type === "dingtalk" ? (
