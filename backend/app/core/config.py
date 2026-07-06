@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     live_start_backfill_limit: int = 5000
     live_start_backfill_window_hours: int = 24
     default_admin_username: str = "admin"
-    default_admin_password: str = "change-me-before-first-run"
+    default_admin_password: str = "admin123"
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",

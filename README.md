@@ -36,7 +36,7 @@ WATCHOUT_TELEGRAM_DATABASE_URL=postgresql+psycopg://watchout:watchout_dev_passwo
 ```text
 WATCHOUT_TELEGRAM_SECRET_KEY=replace-with-a-long-random-secret
 WATCHOUT_TELEGRAM_DEFAULT_ADMIN_USERNAME=admin
-WATCHOUT_TELEGRAM_DEFAULT_ADMIN_PASSWORD=change-me-before-first-run
+WATCHOUT_TELEGRAM_DEFAULT_ADMIN_PASSWORD=admin123
 POSTGRES_PASSWORD=change-me-too
 ```
 
@@ -57,9 +57,11 @@ Health    http://127.0.0.1:8000/health
 后台登录账号来自 `.env`：
 
 ```text
-username: WATCHOUT_TELEGRAM_DEFAULT_ADMIN_USERNAME
-password: WATCHOUT_TELEGRAM_DEFAULT_ADMIN_PASSWORD
+username: admin
+password: admin123
 ```
+
+首次登录后，建议进入 **设置 -> 登录密码** 修改默认密码。
 
 ### 3. 常用命令
 
@@ -214,7 +216,7 @@ API 示例：
 ```bash
 TOKEN=$(curl -sS -X POST http://127.0.0.1:8000/api/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"change-me-before-first-run"}' \
+  -d '{"username":"admin","password":"admin123"}' \
   | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
 
 curl -sS -X POST \
