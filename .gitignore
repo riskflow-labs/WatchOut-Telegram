@@ -36,3 +36,4 @@ frontend/dist/
 
 # Local exports
 output/
+.playwright-cli/

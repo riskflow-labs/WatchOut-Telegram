@@ -4,25 +4,33 @@ import csv
 import io
 import json
 import re
+import asyncio
 from urllib.parse import parse_qs, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
+from sqlalchemy import delete, func, update
 from sqlalchemy.orm import Session
 from telethon.errors import FloodWaitError, RPCError, UserAlreadyParticipantError
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
-from app.models import TelegramAccount, TelegramTarget, User
+from app.models import CrawlError, MessageMedia, MonitorRun, NotificationDelivery, RuleHit, TelegramAccount, TelegramMessage, TelegramTarget, User
+from app.services.collection_settings import get_collection_settings
 from app.schemas import (
     BackfillIn,
+    DeleteOut,
     MonitorRunOut,
     TargetBulkCreateIn,
     TargetBulkCreateOut,
+    TargetBulkDeleteIn,
     TargetCheckIn,
     TargetCheckItem,
     TargetCheckOut,
+    TargetDeleteIn,
     TargetImportDialogsIn,
+    TargetMetadataSyncItem,
+    TargetMetadataSyncOut,
     TargetParseIn,
     TargetParseItem,
     TargetParseOut,
@@ -30,12 +38,15 @@ from app.schemas import (
     TelegramTargetOut,
     TelegramTargetPatch,
 )
-from app.telegram.login_flow import build_client
-from app.telegram.runtime import runtime
+from app.telegram.runtime import runtime, target_metadata_from_entity
 from app.telegram.utils import normalize_target
+from app.workers.initial_collection import initial_collection_queue
 
 
 router = APIRouter(prefix="/targets", tags=["targets"])
+
+METADATA_SYNC_BATCH_BUDGET_SECONDS = 45
+METADATA_SYNC_TARGET_TIMEOUT_SECONDS = 8
 
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
@@ -46,7 +57,17 @@ def list_targets(
     _user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[TelegramTarget]:
-    return db.query(TelegramTarget).order_by(TelegramTarget.id.desc()).all()
+    rows = db.query(TelegramTarget).order_by(TelegramTarget.id.desc()).all()
+    counts = dict(
+        db.query(TelegramMessage.target_id, func.count(TelegramMessage.id))
+        .filter(TelegramMessage.target_id.isnot(None))
+        .group_by(TelegramMessage.target_id)
+        .all()
+    )
+    for row in rows:
+        row.message_count = int(counts.get(row.id, 0))
+    _attach_last_runs(rows, db)
+    return rows
 
 
 @router.post("/parse", response_model=TargetParseOut)
@@ -61,8 +82,10 @@ def parse_targets(
     }
     seen: dict[str, int] = {}
     items: list[TargetParseItem] = []
+    raw_total = 0
     for line_no, raw in _iter_input_lines(payload.text):
-        item = _parse_target_line(line_no, raw, payload.account_id, payload.target_type)
+        raw_total += 1
+        item = _parse_target_line(line_no, raw, payload.account_id, payload.target_type, payload.target_group)
         if item.normalized_target:
             if item.normalized_target in existing:
                 item.status = "duplicate"
@@ -73,8 +96,9 @@ def parse_targets(
                 item.reason = f"与第 {seen[item.normalized_target]} 行重复"
             else:
                 seen[item.normalized_target] = line_no
-        items.append(item)
-    return _parse_out(items)
+        if item.status != "duplicate":
+            items.append(item)
+    return _parse_out(items, raw_total=raw_total)
 
 
 @router.get("/export")
@@ -99,6 +123,8 @@ def export_targets(
         "target",
         "normalized_target",
         "target_type",
+        "participants_count",
+        "about",
         "account_id",
         "enabled",
         "status",
@@ -120,6 +146,7 @@ def export_targets(
 @router.post("/import-dialogs", response_model=TargetBulkCreateOut)
 def import_dialogs(
     payload: TargetImportDialogsIn,
+    background_tasks: BackgroundTasks,
     _user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TargetBulkCreateOut:
@@ -130,15 +157,18 @@ def import_dialogs(
             status=dialog.status,
             reason=dialog.reason,
             detected_type="dialog",
-            target_type=dialog.target_type,
-            target=dialog.target,
+        target_type=dialog.target_type,
+        target_group=payload.target_group,
+        target=dialog.target,
             normalized_target=dialog.normalized_target,
             title=dialog.title,
             account_id=payload.account_id,
+            participants_count=dialog.participants_count,
+            about="",
         )
         for index, dialog in enumerate(payload.dialogs, start=1)
     ]
-    return _bulk_create(items, db)
+    return _bulk_create(items, db, background_tasks)
 
 
 @router.post("/check-bulk", response_model=TargetCheckOut)
@@ -151,60 +181,79 @@ async def check_targets(
     if not account:
         raise HTTPException(status_code=400, detail="no authorized Telegram account available")
 
-    client = build_client(account)
-    await client.connect()
     try:
-        if not await client.is_user_authorized():
-            account.status = "unauthorized"
-            db.commit()
-            raise HTTPException(status_code=400, detail="account is not authorized")
-        results: list[TargetCheckItem] = []
-        for item in payload.items:
-            results.append(await _check_target_item(client, item, payload.auto_join_invites))
-        return TargetCheckOut(
-            items=results,
-            total=len(results),
-            accessible=sum(1 for item in results if item.status == "accessible"),
-            failed=sum(1 for item in results if item.status != "accessible"),
-        )
-    finally:
-        await client.disconnect()
+        async def check_with_client(client):
+            results: list[TargetCheckItem] = []
+            for item in payload.items:
+                try:
+                    results.append(await asyncio.wait_for(_check_target_item(client, item, payload.auto_join_invites), timeout=20))
+                except TimeoutError:
+                    results.append(_check_result(item, "failed", "timeout", "检测超时：Telegram 未及时响应"))
+            return TargetCheckOut(
+                items=results,
+                total=len(results),
+                accessible=sum(1 for item in results if item.status == "accessible"),
+                failed=sum(1 for item in results if item.status != "accessible"),
+            )
+
+        return await runtime.with_account_client(account.id, check_with_client)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/bulk", response_model=TargetBulkCreateOut)
 def bulk_create_targets(
     payload: TargetBulkCreateIn,
+    background_tasks: BackgroundTasks,
     _user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TargetBulkCreateOut:
-    return _bulk_create(payload.items, db)
+    return _bulk_create(payload.items, db, background_tasks)
+
+
+@router.delete("/bulk", response_model=DeleteOut)
+async def bulk_delete_targets(
+    payload: TargetBulkDeleteIn,
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DeleteOut:
+    target_ids = [int(item) for item in dict.fromkeys(payload.target_ids) if item]
+    return await _delete_targets(target_ids, payload.delete_messages, db)
 
 
 @router.post("", response_model=TelegramTargetOut)
 def create_target(
     payload: TelegramTargetCreate,
+    background_tasks: BackgroundTasks,
     _user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TelegramTarget:
+    config = get_collection_settings(db)
+    account_id = payload.account_id or _select_balanced_account_id(db, config)
     target = TelegramTarget(
-        account_id=payload.account_id,
+        account_id=account_id,
         title=payload.title or payload.target,
         target=payload.target,
         normalized_target=normalize_target(payload.target),
         target_type=payload.target_type,
+        target_group=payload.target_group.strip(),
+        about=payload.about,
         enabled=payload.enabled,
     )
     db.add(target)
     db.commit()
     db.refresh(target)
+    _schedule_initial_collection(background_tasks, [target.id], db)
     return target
 
 
-def _bulk_create(items: list[TargetParseItem], db: Session) -> TargetBulkCreateOut:
+def _bulk_create(items: list[TargetParseItem], db: Session, background_tasks: BackgroundTasks) -> TargetBulkCreateOut:
     existing = {
         row.normalized_target: row.id
         for row in db.query(TelegramTarget.id, TelegramTarget.normalized_target).all()
     }
+    config = get_collection_settings(db)
+    account_loads = _account_loads(db)
     created: list[TelegramTarget] = []
     skipped: list[TargetParseItem] = []
     seen: set[str] = set()
@@ -215,26 +264,161 @@ def _bulk_create(items: list[TargetParseItem], db: Session) -> TargetBulkCreateO
         if item.normalized_target in existing or item.normalized_target in seen:
             skipped.append(item.model_copy(update={"status": "duplicate", "reason": "目标已存在或本次重复"}))
             continue
+        account_id = item.account_id or _select_balanced_account_id(db, config, account_loads)
         target = TelegramTarget(
-            account_id=item.account_id,
+            account_id=account_id,
             title=item.title or item.target,
             target=item.target,
             normalized_target=item.normalized_target,
             target_type=item.target_type,
+            target_group=item.target_group.strip(),
+            participants_count=item.participants_count,
+            about=item.about,
             enabled=True,
         )
         db.add(target)
         created.append(target)
         seen.add(item.normalized_target)
+        if account_id:
+            account_loads[account_id] = account_loads.get(account_id, 0) + 1
     db.commit()
     for target in created:
         db.refresh(target)
+    _schedule_initial_collection(background_tasks, [target.id for target in created], db)
     return TargetBulkCreateOut(
         created=created,
         skipped=skipped,
         created_count=len(created),
         skipped_count=len(skipped),
     )
+
+
+def _schedule_initial_collection(background_tasks: BackgroundTasks, target_ids: list[int], db: Session) -> None:
+    if not target_ids:
+        return
+    config = get_collection_settings(db)
+    if not config["auto_backfill_on_import"] and not config["auto_start_listening_on_import"]:
+        return
+    db.query(TelegramTarget).filter(TelegramTarget.id.in_(target_ids)).update(
+        {TelegramTarget.status: "initializing", TelegramTarget.last_error: ""},
+        synchronize_session=False,
+    )
+    db.commit()
+    background_tasks.add_task(initial_collection_queue.submit_targets, target_ids)
+
+
+def _account_loads(db: Session) -> dict[int, int]:
+    rows = (
+        db.query(TelegramTarget.account_id, func.count(TelegramTarget.id))
+        .filter(TelegramTarget.account_id.isnot(None), TelegramTarget.enabled == True)  # noqa: E712
+        .group_by(TelegramTarget.account_id)
+        .all()
+    )
+    return {int(account_id): int(count) for account_id, count in rows if account_id is not None}
+
+
+def _select_balanced_account_id(
+    db: Session,
+    config: dict[str, object],
+    loads: dict[int, int] | None = None,
+) -> int | None:
+    account_loads = loads if loads is not None else _account_loads(db)
+    max_targets = int(config.get("max_targets_per_account") or 0)
+    accounts = (
+        db.query(TelegramAccount.id)
+        .filter(TelegramAccount.status == "authorized", TelegramAccount.is_active == True)  # noqa: E712
+        .order_by(TelegramAccount.id.asc())
+        .all()
+    )
+    candidates: list[tuple[int, int]] = []
+    for row in accounts:
+        load = account_loads.get(row.id, 0)
+        if max_targets <= 0 or load < max_targets:
+            candidates.append((load, row.id))
+    if not candidates:
+        return None
+    return min(candidates)[1]
+
+
+def _attach_last_runs(targets: list[TelegramTarget], db: Session) -> None:
+    target_ids = [target.id for target in targets]
+    if not target_ids:
+        return
+    rows = (
+        db.query(MonitorRun)
+        .filter(MonitorRun.target_id.in_(target_ids), MonitorRun.mode == "backfill")
+        .order_by(MonitorRun.started_at.desc(), MonitorRun.id.desc())
+        .all()
+    )
+    seen: set[int] = set()
+    targets_by_id = {target.id: target for target in targets}
+    for run in rows:
+        if not run.target_id or run.target_id in seen:
+            continue
+        target = targets_by_id.get(run.target_id)
+        if not target:
+            continue
+        seen.add(run.target_id)
+        target.last_run_id = run.id
+        target.last_run_at = run.finished_at or run.started_at
+        target.last_run_records = int(run.records_written or run.records_seen or 0)
+        if run.status == "running":
+            target.status = "backfilling"
+
+
+async def _delete_targets(target_ids: list[int], delete_messages: bool, db: Session) -> DeleteOut:
+    if not target_ids:
+        return DeleteOut(deleted=0)
+    existing_ids = [row.id for row in db.query(TelegramTarget.id).filter(TelegramTarget.id.in_(target_ids)).all()]
+    if not existing_ids:
+        return DeleteOut(deleted=0)
+    for target_id in existing_ids:
+        try:
+            await runtime.remove_target(target_id)
+        except Exception:
+            pass
+    deleted_messages = deleted_hits = deleted_media = 0
+    if delete_messages:
+        deleted_messages, deleted_hits, deleted_media = _delete_messages_for_targets(db, existing_ids)
+    else:
+        db.query(TelegramMessage).filter(TelegramMessage.target_id.in_(existing_ids)).update(
+            {TelegramMessage.target_id: None},
+            synchronize_session=False,
+        )
+    db.query(MonitorRun).filter(MonitorRun.target_id.in_(existing_ids)).update(
+        {MonitorRun.target_id: None},
+        synchronize_session=False,
+    )
+    db.query(CrawlError).filter(CrawlError.target_id.in_(existing_ids)).update(
+        {CrawlError.target_id: None},
+        synchronize_session=False,
+    )
+    deleted = db.query(TelegramTarget).filter(TelegramTarget.id.in_(existing_ids)).delete(synchronize_session=False)
+    db.commit()
+    return DeleteOut(deleted=deleted, deleted_messages=deleted_messages, deleted_hits=deleted_hits, deleted_media=deleted_media)
+
+
+def _delete_messages_for_targets(db: Session, target_ids: list[int]) -> tuple[int, int, int]:
+    message_filter = TelegramMessage.target_id.in_(target_ids)
+    message_count = db.query(func.count(TelegramMessage.id)).filter(message_filter).scalar() or 0
+    if not message_count:
+        return 0, 0, 0
+    message_ids = db.query(TelegramMessage.id).filter(message_filter).subquery()
+    db.execute(
+        update(NotificationDelivery)
+        .where(NotificationDelivery.message_id.in_(message_ids))
+        .values(message_id=None)
+    )
+    deleted_hits = db.execute(
+        delete(RuleHit).where(RuleHit.message_id.in_(message_ids))
+    ).rowcount or 0
+    deleted_media = db.execute(
+        delete(MessageMedia).where(MessageMedia.message_id.in_(message_ids))
+    ).rowcount or 0
+    deleted_messages = db.query(TelegramMessage).filter(message_filter).delete(
+        synchronize_session=False,
+    )
+    return int(deleted_messages), int(deleted_hits), int(deleted_media)
 
 
 def _target_payload(row: TelegramTarget) -> dict[str, object]:
@@ -245,9 +429,16 @@ def _target_payload(row: TelegramTarget) -> dict[str, object]:
         "target": row.target,
         "normalized_target": row.normalized_target,
         "target_type": row.target_type,
+        "target_group": row.target_group,
+        "participants_count": row.participants_count,
+        "message_count": getattr(row, "message_count", 0),
+        "about": row.about,
         "enabled": row.enabled,
         "status": row.status,
         "last_message_at": row.last_message_at.isoformat() if row.last_message_at else "",
+        "last_run_id": getattr(row, "last_run_id", None),
+        "last_run_at": getattr(row, "last_run_at", None).isoformat() if getattr(row, "last_run_at", None) else "",
+        "last_run_records": getattr(row, "last_run_records", 0),
         "last_error": row.last_error,
         "created_at": row.created_at.isoformat() if row.created_at else "",
         "updated_at": row.updated_at.isoformat() if row.updated_at else "",
@@ -285,9 +476,17 @@ async def _check_target_item(client, item: TargetParseItem, auto_join_invites: b
                 await client(CheckChatInviteRequest(invite_hash))
             return _check_result(item, "accessible", "", "邀请链接可访问")
         entity = await client.get_entity(item.normalized_target)
-        title = getattr(entity, "title", None) or getattr(entity, "username", None) or item.title
-        target_type = "channel" if bool(getattr(entity, "broadcast", False)) and not bool(getattr(entity, "megagroup", False)) else item.target_type
-        return _check_result(item, "accessible", "", "目标可访问", title=str(title or item.title), target_type=target_type)
+        metadata = await target_metadata_from_entity(client, entity, item.target_type)
+        return _check_result(
+            item,
+            "accessible",
+            "",
+            "目标可访问",
+            title=str(metadata["title"] or item.title),
+            target_type=str(metadata["target_type"] or item.target_type),
+            participants_count=metadata["participants_count"],
+            about=metadata["about"],
+        )
     except FloodWaitError as exc:
         return _check_result(item, "failed", "flood_wait", f"Telegram 限流，等待 {getattr(exc, 'seconds', '?')} 秒")
     except ValueError as exc:
@@ -296,6 +495,19 @@ async def _check_target_item(client, item: TargetParseItem, auto_join_invites: b
         return _check_result(item, "failed", exc.__class__.__name__, str(exc))
     except Exception as exc:
         return _check_result(item, "failed", exc.__class__.__name__, str(exc))
+
+
+async def _sync_target_metadata(client, target: TelegramTarget) -> None:
+    entity = await client.get_entity(target.normalized_target)
+    metadata = await target_metadata_from_entity(client, entity, target.target_type)
+    if metadata["title"]:
+        target.title = str(metadata["title"])
+    if metadata["target_type"]:
+        target.target_type = str(metadata["target_type"])
+    if metadata["participants_count"] is not None:
+        target.participants_count = int(metadata["participants_count"])
+    target.about = str(metadata["about"] or "")
+    target.last_error = ""
 
 
 def _invite_hash(normalized_target: str) -> str:
@@ -314,6 +526,8 @@ def _check_result(
     reason: str,
     title: str | None = None,
     target_type: str | None = None,
+    participants_count: int | None = None,
+    about: str | None = None,
 ) -> TargetCheckItem:
     return TargetCheckItem(
         line=item.line,
@@ -325,6 +539,9 @@ def _check_result(
         reason=reason,
         title=title or item.title,
         target_type=target_type or item.target_type,
+        target_group=item.target_group,
+        participants_count=participants_count if participants_count is not None else item.participants_count,
+        about=about if about is not None else item.about,
     )
 
 
@@ -375,7 +592,7 @@ def _targets_from_json_value(value) -> list[str]:
     return targets
 
 
-def _parse_target_line(line: int, raw: str, account_id: int | None, target_type: str) -> TargetParseItem:
+def _parse_target_line(line: int, raw: str, account_id: int | None, target_type: str, target_group: str = "") -> TargetParseItem:
     value = _strip_wrappers(raw)
     detected = "unknown"
     normalized = ""
@@ -456,6 +673,7 @@ def _parse_target_line(line: int, raw: str, account_id: int | None, target_type:
         normalized_target=normalized,
         title=title,
         account_id=account_id,
+        target_group=target_group.strip(),
     )
 
 
@@ -482,12 +700,14 @@ def _title_from_target(normalized: str, detected_type: str) -> str:
     return f"Telegram / {normalized}"
 
 
-def _parse_out(items: list[TargetParseItem]) -> TargetParseOut:
+def _parse_out(items: list[TargetParseItem], raw_total: int | None = None) -> TargetParseOut:
+    total = raw_total if raw_total is not None else len(items)
     return TargetParseOut(
         items=items,
         total=len(items),
+        raw_total=total,
         importable=sum(1 for item in items if item.status == "ready"),
-        duplicated=sum(1 for item in items if item.status == "duplicate"),
+        duplicated=max(0, total - len(items)) + sum(1 for item in items if item.status == "duplicate"),
         invalid=sum(1 for item in items if item.status == "invalid"),
     )
 
@@ -502,15 +722,134 @@ def patch_target(
     target = db.get(TelegramTarget, target_id)
     if not target:
         raise HTTPException(status_code=404, detail="target not found")
-    if payload.account_id is not None:
+    if payload.account_id_set:
         target.account_id = payload.account_id
     if payload.title is not None:
         target.title = payload.title
+    if payload.target_group is not None:
+        target.target_group = payload.target_group.strip()
     if payload.enabled is not None:
         target.enabled = payload.enabled
     db.commit()
     db.refresh(target)
     return target
+
+
+@router.delete("/{target_id}", response_model=DeleteOut)
+async def delete_target(
+    target_id: int,
+    payload: TargetDeleteIn,
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> DeleteOut:
+    return await _delete_targets([target_id], payload.delete_messages, db)
+
+
+@router.post("/sync-metadata", response_model=TargetMetadataSyncOut)
+async def sync_targets_metadata(
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TargetMetadataSyncOut:
+    targets = db.query(TelegramTarget).order_by(TelegramTarget.id.asc()).all()
+    accounts = (
+        db.query(TelegramAccount)
+        .filter(TelegramAccount.status == "authorized", TelegramAccount.is_active == True)  # noqa: E712
+        .order_by(TelegramAccount.id.asc())
+        .all()
+    )
+    if not accounts:
+        raise HTTPException(status_code=400, detail="no authorized Telegram account available")
+    accounts_by_id = {account.id: account for account in accounts}
+    fallback_account = accounts[0]
+    targets_by_account: dict[int, list[TelegramTarget]] = {account.id: [] for account in accounts}
+    for target in targets:
+        account_id = target.account_id if target.account_id in accounts_by_id else fallback_account.id
+        targets_by_account.setdefault(account_id, []).append(target)
+
+    items: list[TargetMetadataSyncItem] = []
+    deadline = asyncio.get_running_loop().time() + METADATA_SYNC_BATCH_BUDGET_SECONDS
+    budget_message = "本次同步达到时间预算，剩余目标留到下一次同步"
+
+    def mark_budget_skipped(account_targets: list[TelegramTarget]) -> None:
+        for target in account_targets:
+            target.last_error = budget_message
+            items.append(TargetMetadataSyncItem(id=target.id, title=target.title, status="failed", message=budget_message))
+
+    for account_id, account_targets in targets_by_account.items():
+        if not account_targets:
+            continue
+        if asyncio.get_running_loop().time() >= deadline:
+            mark_budget_skipped(account_targets)
+            db.commit()
+            continue
+        try:
+            async def sync_with_client(client):
+                for index, target in enumerate(account_targets):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        mark_budget_skipped(account_targets[index:])
+                        break
+                    try:
+                        timeout = max(1, min(METADATA_SYNC_TARGET_TIMEOUT_SECONDS, remaining))
+                        await asyncio.wait_for(_sync_target_metadata(client, target), timeout=timeout)
+                        items.append(TargetMetadataSyncItem(id=target.id, title=target.title, status="updated", message="已刷新"))
+                    except (TimeoutError, asyncio.TimeoutError):
+                        target.last_error = "同步超时：Telegram 未及时响应"
+                        items.append(TargetMetadataSyncItem(id=target.id, title=target.title, status="failed", message=target.last_error))
+                    except FloodWaitError as exc:
+                        target.last_error = f"Telegram 限流，等待 {getattr(exc, 'seconds', '?')} 秒"
+                        items.append(TargetMetadataSyncItem(id=target.id, title=target.title, status="failed", message=target.last_error))
+                    except Exception as exc:
+                        target.last_error = str(exc)
+                        items.append(TargetMetadataSyncItem(id=target.id, title=target.title, status="failed", message=str(exc)))
+                    db.commit()
+                return None
+
+            await runtime.with_account_client(account_id, sync_with_client)
+        except Exception as exc:
+            for target in account_targets:
+                message = str(exc)
+                target.last_error = message
+                items.append(TargetMetadataSyncItem(id=target.id, title=target.title, status="failed", message=message))
+            db.commit()
+    updated = sum(1 for item in items if item.status == "updated")
+    failed = len(items) - updated
+    return TargetMetadataSyncOut(total=len(items), updated=updated, failed=failed, items=items)
+
+
+@router.post("/{target_id}/sync-title", response_model=TelegramTargetOut)
+async def sync_target_title(
+    target_id: int,
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TelegramTarget:
+    target = db.get(TelegramTarget, target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="target not found")
+    account = _select_authorized_account(db, target.account_id)
+    if not account:
+        raise HTTPException(status_code=400, detail="no authorized Telegram account available")
+    try:
+        async def sync_with_client(client):
+            await _sync_target_metadata(client, target)
+            db.commit()
+            db.refresh(target)
+            return None
+
+        await runtime.with_account_client(account.id, sync_with_client)
+        return target
+    except FloodWaitError as exc:
+        target.last_error = f"Telegram 限流，等待 {getattr(exc, 'seconds', '?')} 秒"
+        db.commit()
+        raise HTTPException(status_code=400, detail=target.last_error) from exc
+    except RuntimeError as exc:
+        target.last_error = str(exc)
+        db.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        target.last_error = str(exc)
+        db.commit()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/{target_id}/start")
@@ -525,10 +864,22 @@ async def start_target(
     if not target.enabled:
         raise HTTPException(status_code=400, detail="target disabled")
     try:
+        collection_config = get_collection_settings(db)
+        if int(collection_config["initial_backfill_limit"]) > 0:
+            await runtime.backfill_target(
+                target_id,
+                int(collection_config["initial_backfill_limit"]),
+                since_hours=int(collection_config["initial_backfill_window_hours"]),
+            )
         await runtime.add_target(target_id)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "listening", "target_id": target_id}
+    return {
+        "status": "listening",
+        "target_id": target_id,
+        "backfilled": int(collection_config["initial_backfill_limit"]),
+        "backfill_window_hours": int(collection_config["initial_backfill_window_hours"]),
+    }
 
 
 @router.post("/{target_id}/stop")
@@ -553,6 +904,11 @@ async def backfill(
     if not target.enabled:
         raise HTTPException(status_code=400, detail="target disabled")
     try:
-        return await runtime.backfill_target(target_id, payload.limit, since_days=payload.since_days)
+        return await runtime.backfill_target(
+            target_id,
+            payload.limit,
+            since_days=payload.since_days,
+            since_hours=payload.since_hours,
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

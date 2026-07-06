@@ -35,10 +35,32 @@ class TelegramAccount(Base):
     status: Mapped[str] = mapped_column(String(40), default="created")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_error: Mapped[str] = mapped_column(Text, default="")
+    health_status: Mapped[str] = mapped_column(String(40), default="unchecked")
+    health_message: Mapped[str] = mapped_column(Text, default="")
+    health_me: Mapped[str] = mapped_column(String(160), default="")
+    health_target_count: Mapped[int] = mapped_column(Integer, default=0)
+    health_listening_target_count: Mapped[int] = mapped_column(Integer, default=0)
+    health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    proxy_status: Mapped[str] = mapped_column(String(40), default="unchecked")
+    proxy_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    proxy_message: Mapped[str] = mapped_column(Text, default="")
+    proxy_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     targets: Mapped[list["TelegramTarget"]] = relationship(back_populates="account")
+
+
+class AccountEvent(Base):
+    __tablename__ = "account_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("telegram_accounts.id"), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(80), default="")
+    status: Mapped[str] = mapped_column(String(40), default="success")
+    summary: Mapped[str] = mapped_column(String(255), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class TelegramLoginFlow(Base):
@@ -62,6 +84,9 @@ class TelegramTarget(Base):
     target: Mapped[str] = mapped_column(String(500), index=True)
     normalized_target: Mapped[str] = mapped_column(String(255), index=True)
     target_type: Mapped[str] = mapped_column(String(40), default="group")
+    target_group: Mapped[str] = mapped_column(String(120), default="", index=True)
+    participants_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    about: Mapped[str] = mapped_column(Text, default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     status: Mapped[str] = mapped_column(String(40), default="idle")
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -91,6 +116,16 @@ class MonitorRule(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class MonitorRuleNotificationChannel(Base):
+    __tablename__ = "monitor_rule_notification_channels"
+    __table_args__ = (UniqueConstraint("rule_id", "channel_id", name="uq_rule_notification_channel"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("monitor_rules.id"), index=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("notification_channels.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TelegramMessage(Base):
     __tablename__ = "telegram_messages"
     __table_args__ = (
@@ -114,6 +149,13 @@ class TelegramMessage(Base):
     sender_username: Mapped[str] = mapped_column(String(160), default="")
     sender_name: Mapped[str] = mapped_column(String(255), default="")
     content: Mapped[str] = mapped_column(Text, default="")
+    language: Mapped[str] = mapped_column(String(20), default="")
+    translated_content: Mapped[str] = mapped_column(Text, default="")
+    translation_status: Mapped[str] = mapped_column(String(40), default="pending")
+    translation_engine: Mapped[str] = mapped_column(String(80), default="")
+    ocr_text: Mapped[str] = mapped_column(Text, default="")
+    ocr_status: Mapped[str] = mapped_column(String(40), default="pending")
+    ocr_engine: Mapped[str] = mapped_column(String(80), default="")
     content_md5: Mapped[str] = mapped_column(String(32), default="", index=True)
     data_id: Mapped[str] = mapped_column(String(32), default="", index=True)
     similar_id: Mapped[str] = mapped_column(String(32), default="", index=True)
@@ -137,6 +179,31 @@ class TelegramMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     hits: Mapped[list["RuleHit"]] = relationship(back_populates="message")
+    media_items: Mapped[list["MessageMedia"]] = relationship(back_populates="message")
+
+
+class MessageMedia(Base):
+    __tablename__ = "message_media"
+    __table_args__ = (UniqueConstraint("message_id", "media_index", name="uq_message_media_index"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("telegram_messages.id"), index=True)
+    media_index: Mapped[int] = mapped_column(Integer, default=0)
+    media_kind: Mapped[str] = mapped_column(String(40), default="")
+    file_name: Mapped[str] = mapped_column(String(500), default="")
+    mime_type: Mapped[str] = mapped_column(String(160), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    local_path: Mapped[str] = mapped_column(String(1000), default="")
+    thumbnail_path: Mapped[str] = mapped_column(String(1000), default="")
+    download_status: Mapped[str] = mapped_column(String(40), default="metadata_only")
+    ocr_status: Mapped[str] = mapped_column(String(40), default="pending")
+    ocr_engine: Mapped[str] = mapped_column(String(80), default="")
+    ocr_text: Mapped[str] = mapped_column(Text, default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    message: Mapped[TelegramMessage] = relationship(back_populates="media_items")
 
 
 class CrawlError(Base):

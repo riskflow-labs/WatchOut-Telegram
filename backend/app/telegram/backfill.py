@@ -12,7 +12,92 @@ from app.storage.sinks import export_message
 from app.telegram.login_flow import build_client
 
 
-async def backfill_target(target_id: int, limit: int = 20, since_days: int | None = None) -> MonitorRun:
+async def backfill_targets_with_account(
+    account: TelegramAccount,
+    targets: list[TelegramTarget],
+    limit: int = 20,
+    since_days: int | None = None,
+    since_hours: int | None = None,
+) -> list[MonitorRun]:
+    if not targets:
+        return []
+
+    run_ids: list[int] = []
+    target_by_id: dict[int, str] = {}
+    since_at = None
+    if since_hours:
+        since_at = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    elif since_days:
+        since_at = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    db = SessionLocal()
+    try:
+        for target in targets:
+            run = MonitorRun(account_id=account.id, target_id=target.id, mode="backfill", status="running")
+            db.add(run)
+            db.flush()
+            run_ids.append(run.id)
+            target_by_id[target.id] = target.normalized_target
+        (
+            db.query(TelegramTarget)
+            .filter(TelegramTarget.id.in_(target_by_id))
+            .update({TelegramTarget.status: "backfilling", TelegramTarget.last_error: ""}, synchronize_session=False)
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    client = build_client(account)
+    runs: list[MonitorRun] = []
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            _mark_account_unauthorized(account.id)
+            raise RuntimeError("Telegram account is not authorized")
+
+        for run_id, target_id in zip(run_ids, target_by_id, strict=False):
+            count = 0
+            try:
+                entity = await client.get_entity(target_by_id[target_id])
+                chat = await client.get_entity(entity)
+                messages = []
+                async for message in client.iter_messages(chat, limit=limit):
+                    message_date = message.date.astimezone(timezone.utc)
+                    if since_at and message_date < since_at:
+                        break
+                    messages.append(message)
+                for message in reversed(messages):
+                    sender = await message.get_sender()
+                    _write_backfill_message(
+                        run_id=run_id,
+                        account_id=account.id,
+                        target_id=target_id,
+                        message=message,
+                        chat=chat,
+                        sender=sender,
+                    )
+                    count += 1
+                runs.append(_finish_backfill_run(run_id, target_id, "success", "", count))
+            except Exception as exc:
+                runs.append(_finish_backfill_run(run_id, target_id, "failed", str(exc), count))
+                _record_crawl_error(
+                    account_id=account.id,
+                    target_id=target_id,
+                    stage="scheduled_backfill",
+                    error=exc,
+                    retryable=True,
+                )
+        return runs
+    finally:
+        await client.disconnect()
+
+
+async def backfill_target(
+    target_id: int,
+    limit: int = 20,
+    since_days: int | None = None,
+    since_hours: int | None = None,
+) -> MonitorRun:
     account_id: int | None = None
     db = SessionLocal()
     try:
@@ -34,7 +119,11 @@ async def backfill_target(target_id: int, limit: int = 20, since_days: int | Non
         account_id = account.id
         normalized_target = target.normalized_target
         client = build_client(account)
-        since_at = datetime.now(timezone.utc) - timedelta(days=since_days) if since_days else None
+        since_at = None
+        if since_hours:
+            since_at = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        elif since_days:
+            since_at = datetime.now(timezone.utc) - timedelta(days=since_days)
     finally:
         db.close()
 

@@ -38,7 +38,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expi
 
 @listens_for(Engine, "connect")
 def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
-    if not settings.database_url.startswith("sqlite"):
+    if "sqlite" not in type(dbapi_connection).__module__:
         return
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import tempfile
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -38,6 +43,42 @@ def tg_link_discovery(
         {"link": link, "count": count, "example": examples.get(link, "")}
         for link, count in counter.most_common(100)
     ]
+
+
+@router.post("/ocr/test")
+async def test_ocr(
+    file: UploadFile = File(...),
+    language: str = "eng",
+    _user: User = Depends(get_current_user),
+) -> dict[str, object]:
+    if not shutil.which("tesseract"):
+        raise HTTPException(status_code=503, detail="Tesseract OCR is not installed on this machine.")
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".bmp"}:
+        suffix = ".png"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Uploaded image is too large; max size is 10MB.")
+
+    started = time.perf_counter()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as image_file:
+        image_file.write(content)
+        image_file.flush()
+        command = ["tesseract", image_file.name, "stdout", "-l", language, "--psm", "6"]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    if result.returncode != 0:
+        raise HTTPException(status_code=400, detail=(result.stderr or "OCR failed").strip())
+    text = result.stdout.strip()
+    return {
+        "engine": "tesseract",
+        "language": language,
+        "elapsed_ms": elapsed_ms,
+        "text": text,
+        "chars": len(text),
+    }
 
 
 @router.get("/group-graph")

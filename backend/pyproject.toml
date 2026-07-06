@@ -15,6 +15,7 @@ dependencies = [
   "PySocks>=1.7.1",
   "fastapi>=0.111.0",
   "passlib>=1.7.4",
+  "psycopg[binary]>=3.2.0",
   "pydantic-settings>=2.2.1",
   "python-jose[cryptography]>=3.3.0",
   "python-multipart>=0.0.9",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -8,6 +9,9 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from telethon import events, utils
 from telethon.errors import FloodWaitError, RPCError
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.messages import GetFullChatRequest
+from telethon.tl.types import Channel, Chat
 
 from app.core.database import SessionLocal
 from app.models import MonitorRun, TelegramAccount, TelegramTarget
@@ -15,7 +19,86 @@ from app.notifications.dispatcher import dispatch_for_message
 from app.services.messages import upsert_message_from_telethon
 from app.storage.sinks import export_message
 from app.telegram.backfill import backfill_target as backfill_target_once
+from app.telegram.backfill import backfill_targets_with_account
 from app.telegram.login_flow import build_client
+
+
+CLIENT_CONNECT_TIMEOUT_SECONDS = 20
+
+
+async def _safe_disconnect(client) -> None:
+    try:
+        await client.disconnect()
+    except sqlite3.OperationalError as exc:
+        if "database is locked" not in str(exc).lower():
+            raise
+
+
+async def sync_target_metadata_with_client(client, target_id: int) -> None:
+    db = SessionLocal()
+    try:
+        target = db.get(TelegramTarget, target_id)
+        if not target:
+            raise RuntimeError("target not found")
+        entity = await client.get_entity(target.normalized_target)
+        metadata = await target_metadata_from_entity(client, entity, target.target_type)
+        if metadata["title"]:
+            target.title = str(metadata["title"])
+        if metadata["target_type"]:
+            target.target_type = str(metadata["target_type"])
+        if metadata["participants_count"] is not None:
+            target.participants_count = int(metadata["participants_count"])
+        target.about = str(metadata["about"] or "")
+        target.last_error = ""
+        db.commit()
+    finally:
+        db.close()
+
+
+async def target_metadata_from_entity(client, entity, fallback_type: str = "group") -> dict[str, int | str | None]:
+    info = await _target_info(client, entity)
+    return {
+        "title": getattr(entity, "title", None) or getattr(entity, "username", None) or "",
+        "target_type": _target_type_from_entity(entity, fallback_type),
+        "participants_count": info["participants_count"],
+        "about": info["about"],
+    }
+
+
+async def _target_info(client, entity) -> dict[str, int | str | None]:
+    info: dict[str, int | str | None] = {
+        "participants_count": getattr(entity, "participants_count", None),
+        "about": "",
+    }
+    full_chat = None
+    try:
+        if isinstance(entity, Channel):
+            full = await client(GetFullChannelRequest(entity))
+            full_chat = full.full_chat
+        elif isinstance(entity, Chat):
+            full = await client(GetFullChatRequest(entity.id))
+            full_chat = full.full_chat
+    except Exception:
+        full_chat = None
+    if full_chat is not None:
+        info["about"] = getattr(full_chat, "about", "") or ""
+        participants_count = getattr(full_chat, "participants_count", None)
+        if participants_count is not None:
+            info["participants_count"] = participants_count
+        elif info["participants_count"] is None:
+            participants = getattr(getattr(full_chat, "participants", None), "participants", None)
+            info["participants_count"] = len(participants) if participants is not None else None
+    return info
+
+
+def _target_type_from_entity(entity, fallback: str = "group") -> str:
+    if bool(getattr(entity, "broadcast", False)) and not bool(getattr(entity, "megagroup", False)):
+        return "channel"
+    if bool(getattr(entity, "megagroup", False)):
+        return "supergroup"
+    if isinstance(entity, Chat):
+        return "group"
+    return fallback
 
 
 @dataclass
@@ -54,6 +137,17 @@ class MonitorRuntime:
 
     async def stop_target(self, target_id: int) -> None:
         await self.remove_target(target_id)
+
+    async def restore_enabled_targets(self) -> list[int]:
+        target_ids = _load_enabled_target_ids()
+        restored: list[int] = []
+        for target_id in target_ids:
+            try:
+                await self.add_target(target_id)
+                restored.append(target_id)
+            except Exception as exc:
+                _update_target_error(target_id, f"restore listener failed: {exc}", status="idle")
+        return restored
 
     async def add_target(self, target_id: int) -> None:
         account_id = _prepare_target_for_listener(target_id)
@@ -127,7 +221,13 @@ class MonitorRuntime:
         _mark_targets_idle(target_ids)
         return sorted(target_ids)
 
-    async def backfill_target(self, target_id: int, limit: int, since_days: int | None = None) -> MonitorRun:
+    async def backfill_target(
+        self,
+        target_id: int,
+        limit: int,
+        since_days: int | None = None,
+        since_hours: int | None = None,
+    ) -> MonitorRun:
         account_id = _resolve_target_account_id(target_id)
         if account_id is None:
             raise RuntimeError("no authorized Telegram account available")
@@ -139,10 +239,83 @@ class MonitorRuntime:
             if listening_ids:
                 await self.stop_account(account_id)
             try:
-                return await backfill_target_once(target_id, limit, since_days=since_days)
+                return await backfill_target_once(target_id, limit, since_days=since_days, since_hours=since_hours)
             finally:
                 if listening_ids:
                     await self._restart_account_targets(account_id, listening_ids)
+
+    async def backfill_targets_for_account(
+        self,
+        account_id: int,
+        target_ids: list[int],
+        limit: int,
+        since_days: int | None = None,
+        since_hours: int | None = None,
+    ) -> list[MonitorRun]:
+        if not target_ids:
+            return []
+        _ensure_account_authorized(account_id)
+        lock = self._backfill_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            async with self._state_lock:
+                handle = self._accounts.get(account_id)
+                listening_ids = set(handle.target_ids) if handle else set()
+            if listening_ids:
+                await self.stop_account(account_id)
+            try:
+                account = _load_account(account_id)
+                targets = _load_targets_for_account(account_id, set(target_ids))
+                if not targets:
+                    return []
+                _bind_targets_to_account({target.id for target in targets}, account_id)
+                return await backfill_targets_with_account(
+                    account,
+                    targets,
+                    limit=limit,
+                    since_days=since_days,
+                    since_hours=since_hours,
+                )
+            finally:
+                if listening_ids:
+                    await self._restart_account_targets(account_id, listening_ids)
+
+    async def with_account_session_client(self, account_id: int, callback, *, require_authorized: bool = True):
+        if require_authorized:
+            _ensure_account_authorized(account_id)
+        lock = self._backfill_locks.setdefault(account_id, asyncio.Lock())
+        async with lock:
+            async with self._state_lock:
+                handle = self._accounts.get(account_id)
+                listening_ids = set(handle.target_ids) if handle else set()
+            if listening_ids:
+                await self.stop_account(account_id)
+            account = _load_account(account_id, require_authorized=require_authorized)
+            client = build_client(account)
+            try:
+                await asyncio.wait_for(client.connect(), timeout=CLIENT_CONNECT_TIMEOUT_SECONDS)
+                if not client.is_connected():
+                    raise RuntimeError("Telegram 连接已断开，请检查代理或网络出口")
+                if require_authorized and not await client.is_user_authorized():
+                    _mark_account_unauthorized(account_id)
+                    raise RuntimeError("account is not authorized")
+                return await callback(client)
+            finally:
+                await _safe_disconnect(client)
+                if listening_ids:
+                    await self._restart_account_targets(account_id, listening_ids)
+
+    async def with_account_client(self, account_id: int, callback):
+        return await self.with_account_session_client(account_id, callback, require_authorized=True)
+
+    async def sync_target_metadata(self, target_id: int) -> None:
+        account_id = _resolve_target_account_id(target_id)
+        if account_id is None:
+            raise RuntimeError("no authorized Telegram account available")
+
+        async def sync_with_client(client):
+            await sync_target_metadata_with_client(client, target_id)
+
+        await self.with_account_client(account_id, sync_with_client)
 
     async def _restart_account_targets(self, account_id: int, target_ids: set[int]) -> None:
         _ensure_account_authorized(account_id)
@@ -161,12 +334,22 @@ class MonitorRuntime:
             handle.refresh_event.set()
         _mark_targets_listening(target_ids)
 
+    async def _rebalance_targets_after_account_failure(self, failed_account_id: int, target_ids: set[int]) -> None:
+        remaining_ids = _clear_failed_account_binding(failed_account_id, target_ids)
+        for target_id in remaining_ids:
+            try:
+                await self.add_target(target_id)
+            except Exception as exc:
+                _update_target_error(target_id, f"account failover failed: {exc}", status="error")
+
     async def _run_account(self, account_id: int) -> None:
         run_id = _create_live_run(account_id)
+        failed_target_ids: set[int] = set()
+        should_failover = False
         try:
             account = _load_account(account_id)
             client = build_client(account)
-            await client.connect()
+            await asyncio.wait_for(client.connect(), timeout=CLIENT_CONNECT_TIMEOUT_SECONDS)
             if not await client.is_user_authorized():
                 _mark_account_unauthorized(account_id)
                 raise RuntimeError("Telegram account is not authorized")
@@ -184,7 +367,7 @@ class MonitorRuntime:
                         continue
                     await self._listen_account_once(client, run_id, account_id, handle, targets)
             finally:
-                await client.disconnect()
+                await _safe_disconnect(client)
             _finish_run(run_id, "stopped", "")
         except asyncio.CancelledError:
             _finish_run(run_id, "stopped", "")
@@ -197,16 +380,26 @@ class MonitorRuntime:
             error = f"Telegram RPC error: {exc.__class__.__name__}"
             _mark_account_targets_error(account_id, error, status="error")
             _finish_run(run_id, "failed", error)
+            should_failover = not _is_account_available(account_id)
+            if should_failover:
+                failed_target_ids = _load_enabled_target_ids_for_failed_account(account_id)
         except Exception as exc:
             _mark_account_targets_error(account_id, str(exc), status="error")
             _finish_run(run_id, "failed", str(exc))
+            should_failover = not _is_account_available(account_id)
+            if should_failover:
+                failed_target_ids = _load_enabled_target_ids_for_failed_account(account_id)
         finally:
             async with self._state_lock:
                 handle = self._accounts.get(account_id)
                 if handle and handle.task is asyncio.current_task():
                     self._accounts.pop(account_id, None)
+                    if should_failover:
+                        failed_target_ids.update(handle.target_ids)
                     for target_id in handle.target_ids:
                         self._target_accounts.pop(target_id, None)
+            if should_failover and failed_target_ids:
+                await self._rebalance_targets_after_account_failure(account_id, failed_target_ids)
 
     async def _listen_account_once(
         self,
@@ -346,6 +539,15 @@ def _ensure_account_authorized(account_id: int) -> None:
         db.close()
 
 
+def _is_account_available(account_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        account = db.get(TelegramAccount, account_id)
+        return bool(account and account.status == "authorized" and account.is_active)
+    finally:
+        db.close()
+
+
 def _prepare_target_for_listener(target_id: int) -> int:
     db = SessionLocal()
     try:
@@ -366,13 +568,13 @@ def _prepare_target_for_listener(target_id: int) -> int:
         db.close()
 
 
-def _load_account(account_id: int) -> TelegramAccount:
+def _load_account(account_id: int, *, require_authorized: bool = True) -> TelegramAccount:
     db = SessionLocal()
     try:
         account = db.get(TelegramAccount, account_id)
         if account is None:
             raise RuntimeError("account not found")
-        if account.status != "authorized":
+        if require_authorized and account.status != "authorized":
             raise RuntimeError("account is not authorized")
         db.expunge(account)
         return account
@@ -398,6 +600,39 @@ def _load_targets(target_ids: set[int]) -> list[TelegramTarget]:
         db.close()
 
 
+def _load_targets_for_account(account_id: int, target_ids: set[int]) -> list[TelegramTarget]:
+    if not target_ids:
+        return []
+    db = SessionLocal()
+    try:
+        (
+            db.query(TelegramTarget)
+            .filter(
+                TelegramTarget.id.in_(target_ids),
+                TelegramTarget.enabled == True,  # noqa: E712
+                or_(TelegramTarget.account_id == account_id, TelegramTarget.account_id.is_(None)),
+            )
+            .update({TelegramTarget.account_id: account_id}, synchronize_session=False)
+        )
+        db.commit()
+        targets = (
+            db.query(TelegramTarget)
+            .filter(
+                TelegramTarget.id.in_(target_ids),
+                TelegramTarget.enabled == True,  # noqa: E712
+                or_(TelegramTarget.account_id == account_id, TelegramTarget.account_id.is_(None)),
+            )
+            .order_by(TelegramTarget.id.asc())
+            .all()
+        )
+        db.commit()
+        for target in targets:
+            db.expunge(target)
+        return targets
+    finally:
+        db.close()
+
+
 def _load_enabled_target_ids_for_account(account_id: int) -> list[int]:
     db = SessionLocal()
     try:
@@ -416,6 +651,61 @@ def _load_enabled_target_ids_for_account(account_id: int) -> list[int]:
             .all()
         )
         return [row.id for row in rows]
+    finally:
+        db.close()
+
+
+def _load_enabled_target_ids_for_failed_account(account_id: int) -> set[int]:
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TelegramTarget.id)
+            .filter(
+                TelegramTarget.enabled == True,  # noqa: E712
+                TelegramTarget.account_id == account_id,
+            )
+            .all()
+        )
+        return {row.id for row in rows}
+    finally:
+        db.close()
+
+
+def _load_enabled_target_ids() -> list[int]:
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TelegramTarget.id)
+            .filter(TelegramTarget.enabled == True)  # noqa: E712
+            .order_by(TelegramTarget.id.asc())
+            .all()
+        )
+        return [row.id for row in rows]
+    finally:
+        db.close()
+
+
+def _clear_failed_account_binding(account_id: int, target_ids: set[int]) -> set[int]:
+    if not target_ids:
+        return set()
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(TelegramTarget)
+            .filter(
+                TelegramTarget.id.in_(target_ids),
+                TelegramTarget.enabled == True,  # noqa: E712
+                TelegramTarget.account_id == account_id,
+            )
+            .all()
+        )
+        remaining_ids = {target.id for target in rows}
+        for target in rows:
+            target.account_id = None
+            target.status = "idle"
+            target.last_error = ""
+        db.commit()
+        return remaining_ids
     finally:
         db.close()
 

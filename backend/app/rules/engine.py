@@ -21,6 +21,8 @@ def evaluate_rules(message: TelegramMessage, rules: list[MonitorRule]) -> list[R
             message.sender_username or "",
             message.sender_name or "",
             message.content or "",
+            message.translated_content or "",
+            message.ocr_text or "",
         ]
     )
     matches: list[RuleMatch] = []
@@ -32,7 +34,7 @@ def evaluate_rules(message: TelegramMessage, rules: list[MonitorRule]) -> list[R
         sender_blob = " ".join([message.sender_id or "", message.sender_username or "", message.sender_name or ""])
         if not _filter_matches(sender_blob, rule.sender_filter_json):
             continue
-        if _excluded(text, loads_list(rule.exclude_patterns_json)):
+        if _excluded(text, rule.match_type, loads_list(rule.exclude_patterns_json)):
             continue
         patterns = _matched_patterns(text, rule.match_type, loads_list(rule.patterns_json))
         if patterns:
@@ -48,9 +50,21 @@ def _filter_matches(value: str, raw_filter: str) -> bool:
     return any(item in lowered for item in filters)
 
 
-def _excluded(text: str, patterns: list[object]) -> bool:
+def _excluded(text: str, match_type: str, patterns: list[object]) -> bool:
     lowered = text.lower()
-    return any(str(pattern).lower() in lowered for pattern in patterns)
+    for item in patterns:
+        pattern = str(item)
+        if not pattern:
+            continue
+        if match_type == "regex":
+            try:
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    return True
+            except re.error:
+                continue
+        elif pattern.lower() in lowered:
+            return True
+    return False
 
 
 def _matched_patterns(text: str, match_type: str, patterns: list[object]) -> list[str]:
@@ -61,7 +75,11 @@ def _matched_patterns(text: str, match_type: str, patterns: list[object]) -> lis
         if not pattern:
             continue
         if match_type == "regex":
-            if re.search(pattern, text, flags=re.IGNORECASE):
+            try:
+                matched_regex = re.search(pattern, text, flags=re.IGNORECASE)
+            except re.error:
+                matched_regex = None
+            if matched_regex:
                 matched.append(pattern)
         elif match_type == "keyword":
             token = pattern.lower()
